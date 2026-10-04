@@ -1,9 +1,12 @@
 import sqlite3
 import pandas as pd
 import streamlit as st
+import requests
+import json
+import base64
 from datetime import datetime, date
 
-# --- DATABASE LAYER ---
+# --- DATABASE SETUP ---
 DB_FILE = "loco_eats_pnl.db"
 
 def get_connection():
@@ -13,7 +16,6 @@ def get_connection():
 
 def init_db():
     with get_connection() as conn:
-        # 1. Daily Sales Table (Ingested from Square)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_sales (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +27,6 @@ def init_db():
                 order_count INTEGER DEFAULT 0
             )
         """)
-        # 2. Variable Food & Packaging Expenses (COGS)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cogs_expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +38,6 @@ def init_db():
                 notes TEXT
             )
         """)
-        # 3. Fixed Operating Overhead (Amortized Daily)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS fixed_costs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +49,53 @@ def init_db():
 
 init_db()
 
-# --- STREAMLIT DASHBOARD UI ---
+# --- SECURITY ACCESS GATE ---
+def check_password():
+    def password_entered():
+        master_pw = st.secrets.get("APP_PASSWORD", "LocoEats2026!") if hasattr(st, "secrets") else "LocoEats2026!"
+        if st.session_state.get("password_input") == master_pw:
+            st.session_state["password_correct"] = True
+            if "password_input" in st.session_state:
+                del st.session_state["password_input"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if not st.session_state["password_correct"]:
+        st.title("🔒 LOCO Eats Concession Portal")
+        st.caption("Arctic Edge Ice Arena | Management Access Gate")
+        st.text_input("Enter Passcode", type="password", on_change=password_entered, key="password_input")
+        if st.session_state.get("password_correct") is False and "password_input" in st.session_state:
+            st.error("Incorrect passcode.")
+        return False
+    return True
+
+if not check_password():
+    st.stop()
+
+# --- VISION OCR PARSER ---
+def parse_receipt_with_vision(image_bytes, mime_type, api_key):
+    b64_img = base64.b64encode(image_bytes).decode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key.strip()}"
+    prompt = """
+    Extract all individual line items from this restaurant/concession receipt.
+    Assign each item to one of these exact categories: 'Food Ingredients', 'Packaging & Disposables', 'Condiments & Supplies', 'Beverage', 'Dairy', 'Produce', or 'Meat/Poultry'.
+    Return strict JSON with this exact schema:
+    {"vendor": "string", "date": "YYYY-MM-DD", "invoice_num": "string", "items": [{"item_name": "string", "category": "string", "amount": 0.00}]}
+    """
+    payload = {
+        "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_img}}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+    resp = requests.post(url, json=payload, timeout=30)
+    if resp.status_code != 200:
+        return None, f"Vision API Error [{resp.status_code}]: {resp.text}"
+    raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    return json.loads(raw_json), None
+
+# --- STREAMLIT UI CONFIGURATION ---
 st.set_page_config(page_title="LOCO Eats - COGS & P&L Engine", layout="wide")
 st.title("LOCO Eats | Cost Accounting & Sales Reconciliation Engine")
 
@@ -58,37 +104,34 @@ tabs = st.tabs(["📊 Performance Dashboard", "💳 Square Daily Sales", "📦 C
 # --- TAB 1: EXECUTIVE FINANCIAL DASHBOARD ---
 with tabs[0]:
     st.subheader("Financial Performance & Cost of Goods Sold (COGS)")
-    
     conn = get_connection()
     sales_df = pd.read_sql("SELECT * FROM daily_sales ORDER BY sales_date DESC", conn)
     cogs_df = pd.read_sql("SELECT * FROM cogs_expenses ORDER BY expense_date DESC", conn)
     fixed_df = pd.read_sql("SELECT * FROM fixed_costs", conn)
     conn.close()
 
-    total_net_sales = sales_df["net_sales"].sum() if not sales_df.empty else 0.0
-    total_processing_fees = sales_df["processing_fees"].sum() if not sales_df.empty else 0.0
+    total_gross = sales_df["gross_sales"].sum() if not sales_df.empty else 0.0
+    total_net = sales_df["net_sales"].sum() if not sales_df.empty else 0.0
+    total_fees = sales_df["processing_fees"].sum() if not sales_df.empty else 0.0
+    total_orders = sales_df["order_count"].sum() if not sales_df.empty else 0
     
-    # Granular Expense Groupings
     food_spend = cogs_df[cogs_df["category"].isin(["Food Ingredients", "Dairy", "Produce", "Meat/Poultry", "Beverage"])]["amount"].sum()
     packaging_spend = cogs_df[cogs_df["category"] == "Packaging & Disposables"]["amount"].sum()
     condiment_spend = cogs_df[cogs_df["category"] == "Condiments & Supplies"]["amount"].sum()
     total_cogs = food_spend + packaging_spend + condiment_spend
 
-    # Overhead Calculations
     daily_fixed_burn = fixed_df["daily_rate"].sum() if not fixed_df.empty else 0.0
     active_sales_days = len(sales_df["sales_date"].unique()) if not sales_df.empty else 1
     total_amortized_fixed = daily_fixed_burn * max(active_sales_days, 1)
 
-    # Ratios
-    food_cost_pct = (food_spend / total_net_sales * 100) if total_net_sales > 0 else 0.0
-    pkg_cost_pct = (packaging_spend / total_net_sales * 100) if total_net_sales > 0 else 0.0
-    total_cogs_pct = (total_cogs / total_net_sales * 100) if total_net_sales > 0 else 0.0
-    net_profit = total_net_sales - total_cogs - total_amortized_fixed - total_processing_fees
+    food_cost_pct = (food_spend / total_net * 100) if total_net > 0 else 0.0
+    pkg_cost_pct = (packaging_spend / total_net * 100) if total_net > 0 else 0.0
+    net_profit = total_net - total_cogs - total_amortized_fixed - total_fees
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Net Sales (Square)", f"${total_net_sales:,.2f}")
-    col2.metric("Total Food Spend", f"${food_spend:,.2f}", delta=f"{food_cost_pct:.1f}% of Sales", delta_color="inverse")
-    col3.metric("Packaging & Supplies", f"${packaging_spend + condiment_spend:,.2f}", delta=f"{pkg_cost_pct:.1f}% of Sales", delta_color="inverse")
+    col1.metric("Gross Collected", f"${total_gross:,.2f}", delta=f"{total_orders} Orders")
+    col2.metric("Net Sales (Excl. Tax)", f"${total_net:,.2f}")
+    col3.metric("Total COGS Spend", f"${total_cogs:,.2f}", delta=f"{food_cost_pct + pkg_cost_pct:.1f}% COGS")
     col4.metric("Net Contribution Profit", f"${net_profit:,.2f}")
 
     st.markdown("---")
@@ -104,49 +147,164 @@ with tabs[0]:
         else:
             st.info("No expense disbursements logged yet.")
     with c2:
-        st.write("### Operational Benchmarks")
-        st.write(f"- **Target Food Cost %:** `25.0%` (Current: **`{food_cost_pct:.1f}%`**)")
-        st.write(f"- **Packaging & Paper Target:** `3.5% - 5.0%` (Current: **`{pkg_cost_pct:.1f}%`**)")
+        st.write("### Sales & Fee Metrics")
+        avg_ticket = (total_gross / total_orders) if total_orders > 0 else 0.0
+        effective_fee = (total_fees / total_gross * 100) if total_gross > 0 else 0.0
+        st.write(f"- **Average Order Value (AOV):** `${avg_ticket:,.2f}`")
+        st.write(f"- **Total Square Processing Fees:** `${total_fees:,.2f}` ({effective_fee:.2f}% of gross)")
         st.write(f"- **Fixed Daily Overhead Allocation:** `${daily_fixed_burn:,.2f} / day`")
 
-# --- TAB 2: SQUARE DAILY SALES SUBMISSION ---
+# --- TAB 2: SQUARE DAILY SALES ---
 with tabs[1]:
-    st.subheader("Ingest Daily Square Sales Report")
-    with st.form("square_entry_form", clear_on_submit=True):
-        f_date = st.date_input("Business Date", value=date.today())
-        c_a, c_b = st.columns(2)
-        f_gross = c_a.number_input("Gross Sales ($)", min_value=0.0, step=10.0, format="%.2f")
-        f_net = c_b.number_input("Net Sales ($)", min_value=0.0, step=10.0, format="%.2f")
-        c_c, c_d = st.columns(2)
-        f_tax = c_c.number_input("Sales Tax Collected ($)", min_value=0.0, step=1.0, format="%.2f")
-        f_fees = c_d.number_input("Square Card Processing Fees ($)", min_value=0.0, step=1.0, format="%.2f")
-        f_orders = st.number_input("Total Order Count", min_value=0, step=1)
-        
-        submit_sales = st.form_submit_button("Commit Square Daily Sales")
-        if submit_sales:
-            conn = get_connection()
-            try:
-                conn.execute("""
-                    INSERT INTO daily_sales (sales_date, gross_sales, net_sales, tax, processing_fees, order_count)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(sales_date) DO UPDATE SET
-                        gross_sales=excluded.gross_sales,
-                        net_sales=excluded.net_sales,
-                        tax=excluded.tax,
-                        processing_fees=excluded.processing_fees,
-                        order_count=excluded.order_count
-                """, (f_date.strftime("%Y-%m-%d"), f_gross, f_net, f_tax, f_fees, f_orders))
-                conn.commit()
-                st.success(f"Successfully recorded Square sales for {f_date.strftime('%Y-%m-%d')}!")
-            except Exception as e:
-                st.error(f"Error saving record: {e}")
-            finally:
-                conn.close()
+    st.subheader("Square Sales Reconciliation")
+    
+    st.markdown("#### 📁 Upload Square Transfer CSV")
+    uploaded_file = st.file_uploader("Upload Square 'transfer-details-*.csv'", type=["csv"])
+    if uploaded_file is not None:
+        try:
+            raw_csv = pd.read_csv(uploaded_file)
+            if "Payment Date" in raw_csv.columns and "Collected" in raw_csv.columns:
+                for col in ["Collected", "Fees", "Deposited"]:
+                    if col in raw_csv.columns:
+                        raw_csv[col] = raw_csv[col].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).astype(float)
+                
+                if "Type" in raw_csv.columns:
+                    raw_csv = raw_csv[raw_csv["Type"] == "Payment"]
+                    
+                grouped = raw_csv.groupby("Payment Date").agg(
+                    gross_sales=("Collected", "sum"),
+                    processing_fees=("Fees", lambda x: abs(x.sum())),
+                    order_count=("Transaction ID", "count" if "Transaction ID" in raw_csv.columns else "size")
+                ).reset_index()
+                
+                grouped.rename(columns={"Payment Date": "sales_date"}, inplace=True)
+                grouped["net_sales"] = (grouped["gross_sales"] / 1.06).round(2)
+                grouped["tax"] = (grouped["gross_sales"] - grouped["net_sales"]).round(2)
 
-# --- TAB 3: COGS, PACKAGING & CONDIMENTS LOG ---
+                if st.button(f"Commit {len(grouped)} Days from CSV"):
+                    conn = get_connection()
+                    for _, r in grouped.iterrows():
+                        conn.execute("""
+                            INSERT INTO daily_sales (sales_date, gross_sales, net_sales, tax, processing_fees, order_count)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(sales_date) DO UPDATE SET
+                                gross_sales=excluded.gross_sales,
+                                net_sales=excluded.net_sales,
+                                tax=excluded.tax,
+                                processing_fees=excluded.processing_fees,
+                                order_count=excluded.order_count
+                        """, (r["sales_date"], r["gross_sales"], r["net_sales"], r["tax"], r["processing_fees"], int(r["order_count"])))
+                    conn.commit()
+                    conn.close()
+                    st.success("Successfully imported all transactions from CSV!")
+                    st.rerun()
+            else:
+                st.error("Uploaded CSV does not match the Square Transfer format.")
+        except Exception as e:
+            st.error(f"Error parsing CSV: {e}")
+
+    st.markdown("---")
+    st.markdown("#### Manual Sales Entry")
+    with st.form("manual_sales_form", clear_on_submit=False):
+        m_date = st.date_input("Business Date", value=date.today())
+        c_1, c_2 = st.columns(2)
+        m_gross = c_1.number_input("Gross Sales ($)", min_value=0.0, step=10.0, format="%.2f")
+        m_net = c_2.number_input("Net Sales ($)", min_value=0.0, step=10.0, format="%.2f")
+        c_3, c_4 = st.columns(2)
+        m_tax = c_3.number_input("Sales Tax Collected ($)", min_value=0.0, step=1.0, format="%.2f")
+        m_fees = c_4.number_input("Square Fees ($)", min_value=0.0, step=1.0, format="%.2f")
+        m_orders = st.number_input("Order Count", min_value=0, step=1)
+        
+        if st.form_submit_button("Commit Daily Record"):
+            conn = get_connection()
+            conn.execute("""
+                INSERT INTO daily_sales (sales_date, gross_sales, net_sales, tax, processing_fees, order_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sales_date) DO UPDATE SET
+                    gross_sales=excluded.gross_sales,
+                    net_sales=excluded.net_sales,
+                    tax=excluded.tax,
+                    processing_fees=excluded.processing_fees,
+                    order_count=excluded.order_count
+            """, (m_date.strftime("%Y-%m-%d"), m_gross, m_net, m_tax, m_fees, m_orders))
+            conn.commit()
+            conn.close()
+            st.success(f"Recorded sales for {m_date.strftime('%Y-%m-%d')}.")
+            st.rerun()
+
+    conn = get_connection()
+    df_sales_history = pd.read_sql("SELECT sales_date as 'Date', gross_sales as 'Gross ($)', net_sales as 'Net ($)', tax as 'Tax ($)', processing_fees as 'Fees ($)', order_count as 'Orders' FROM daily_sales ORDER BY sales_date DESC", conn)
+    conn.close()
+    if not df_sales_history.empty:
+        st.write("#### Reconciled Sales Ledger")
+        st.dataframe(df_sales_history, use_container_width=True)
+
+# --- TAB 3: COGS & PACKAGING LOG (WITH AI VISION SCANNER) ---
 with tabs[2]:
-    st.subheader("Log Direct COGS Disbursement")
-    with st.form("cogs_form", clear_on_submit=True):
+    st.subheader("Direct COGS Ingestion")
+    
+    st.markdown("#### 📷 AI Vision Receipt Scanner (Automated Line-Item Extraction)")
+    st.caption("Take a photo with your phone camera or upload a saved receipt image from Restaurant Depot, Costco, or GFS.")
+    
+    col_cam, col_upload = st.columns(2)
+    with col_cam:
+        cam_pic = st.camera_input("Snap receipt with phone camera")
+    with col_upload:
+        file_pic = st.file_uploader("Or upload image (JPG, PNG)", type=["jpg", "jpeg", "png"])
+        
+    active_receipt = cam_pic or file_pic
+    
+    if active_receipt is not None:
+        vision_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+        if not vision_key:
+            vision_key = st.text_input("Gemini API Key (or save in Streamlit Secrets)", type="password")
+            
+        if st.button("⚡ Scan & Extract Line Items", type="primary"):
+            if not vision_key:
+                st.error("Please enter a Gemini API Key to run Vision OCR.")
+            else:
+                with st.spinner("Analyzing receipt and extracting line items..."):
+                    img_bytes = active_receipt.getvalue()
+                    mime_type = active_receipt.type or "image/jpeg"
+                    parsed_result, err = parse_receipt_with_vision(img_bytes, mime_type, vision_key)
+                    
+                if err:
+                    st.error(err)
+                elif parsed_result:
+                    st.session_state["scanned_receipt"] = parsed_result
+                    st.success(f"Extracted {len(parsed_result.get('items', []))} items from {parsed_result.get('vendor', 'Unknown')}!")
+                    
+    if "scanned_receipt" in st.session_state:
+        rec = st.session_state["scanned_receipt"]
+        st.markdown(f"**Vendor:** `{rec.get('vendor', 'Unknown')}` | **Date:** `{rec.get('date', 'Unknown')}` | **Invoice/Receipt #:** `{rec.get('invoice_num', 'N/A')}`")
+        
+        items_df = pd.DataFrame(rec.get("items", []))
+        st.write("Review and edit categories or amounts if necessary:")
+        edited_df = st.data_editor(items_df, use_container_width=True, num_rows="dynamic")
+        
+        if st.button("💾 Commit Line Items to Database", type="primary"):
+            conn = get_connection()
+            for _, r in edited_df.iterrows():
+                conn.execute("""
+                    INSERT INTO cogs_expenses (expense_date, vendor, category, amount, invoice_num, notes)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    rec.get("date", date.today().strftime("%Y-%m-%d")),
+                    rec.get("vendor", "Scanned Vendor"),
+                    r.get("category", "Food Ingredients"),
+                    float(r.get("amount", 0.0)),
+                    rec.get("invoice_num", ""),
+                    r.get("item_name", "")
+                ))
+            conn.commit()
+            conn.close()
+            st.success("Successfully written to loco_eats_pnl.db!")
+            del st.session_state["scanned_receipt"]
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### ✍️ Manual Outlay Entry")
+    with st.form("manual_cogs_form", clear_on_submit=True):
         c_date = st.date_input("Disbursement Date", value=date.today())
         c_vendor = st.selectbox("Vendor", [
             "Gordon Food Service", "Restaurant Depot", "PepsiCo / Pepsi Beverages",
@@ -161,8 +319,7 @@ with tabs[2]:
         c_inv = st.text_input("Invoice / Receipt Number")
         c_notes = st.text_area("Itemized Details (e.g. 16oz cups, cone sleeves, mozzarella)")
         
-        submit_cogs = st.form_submit_button("Record COGS Outlay")
-        if submit_cogs:
+        if st.form_submit_button("Record COGS Outlay"):
             conn = get_connection()
             conn.execute("""
                 INSERT INTO cogs_expenses (expense_date, vendor, category, amount, invoice_num, notes)
@@ -171,14 +328,20 @@ with tabs[2]:
             conn.commit()
             conn.close()
             st.success("COGS transaction logged.")
+            st.rerun()
 
-# --- TAB 4: FIXED OVERHEAD ALLOCATION ---
+    conn = get_connection()
+    df_cogs_history = pd.read_sql("SELECT expense_date as 'Date', vendor as 'Vendor', category as 'Category', amount as 'Amount ($)', notes as 'Item Description' FROM cogs_expenses ORDER BY expense_date DESC LIMIT 25", conn)
+    conn.close()
+    if not df_cogs_history.empty:
+        st.write("#### Recent COGS Entries")
+        st.dataframe(df_cogs_history, use_container_width=True)
+
+# --- TAB 4: FIXED OVERHEAD ---
 with tabs[3]:
     st.subheader("Monthly Fixed Operating Overhead")
-    st.caption("These costs amortize daily over a standard 30.4-day operational cycle.")
-    
     with st.form("fixed_cost_form", clear_on_submit=True):
-        fc_name = st.text_input("Expense Name (e.g. Arena Concession Base Rent, Insurance, POS Lease, OptiSigns)")
+        fc_name = st.text_input("Expense Name (e.g. Arena Base Rent, Insurance, POS Lease, OptiSigns)")
         fc_amount = st.number_input("Monthly Billed Amount ($)", min_value=0.0, step=25.0, format="%.2f")
         
         if st.form_submit_button("Add / Update Fixed Expense"):
@@ -195,6 +358,7 @@ with tabs[3]:
                 conn.commit()
                 conn.close()
                 st.success(f"Configured {fc_name} at ${d_rate:.2f}/day.")
+                st.rerun()
 
     conn = get_connection()
     df_fixed = pd.read_sql("SELECT item_name as 'Item', monthly_amount as 'Monthly ($)', daily_rate as 'Daily Allocation ($)' FROM fixed_costs", conn)

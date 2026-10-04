@@ -1,0 +1,12 @@
+# Ignore SQLite databases (protects financial and sales records)
+*.db
+*.sqlite3
+loco_eats_pnl.db
+
+# Ignore local environment variables and local Streamlit secrets
+.env
+.streamlit/secrets.toml
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
