@@ -88,16 +88,9 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- URL SANITIZER (FIXES CONNECTION ADAPTER ERRORS) ---
-def clean_api_url(raw_url):
-    """Strips all invisible unicode, zero-width spaces, and whitespace to prevent requests errors."""
-    cleaned = "".join(c for c in str(raw_url) if 32 < ord(c) < 127).strip()
-    match = re.search(r'https?://[a-zA-Z0-9./:?=&_%-]+', cleaned)
-    return match.group(0) if match else cleaned
-
 # --- IMAGE OPTIMIZER & COMPRESSION ---
 def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
-    """Resizes large smartphone photos to prevent HTTP ReadTimeout errors."""
+    """Resizes large smartphone photos to prevent network timeouts."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode in ("RGBA", "P"):
@@ -109,14 +102,43 @@ def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
     except Exception:
         return image_bytes, "image/jpeg"
 
-# --- VISION OCR PARSER ---
+# --- VISION OCR PARSER WITH DYNAMIC MODEL DISCOVERY ---
 def parse_receipt_with_vision(image_bytes, mime_type, api_key):
-    """Sends compressed receipt photo to Google Vision with strict URL cleaning and model failover."""
+    """Discovers live models from Google AI Studio and extracts receipt line items."""
     clean_key = "".join(c for c in str(api_key).strip() if 32 < ord(c) < 127)
+    if not clean_key:
+        return None, "Gemini API Key is empty. Please enter your key or configure Streamlit Secrets."
+
+    # 1. Discover live models directly from Google for this specific key
+    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={clean_key}"
+    try:
+        list_resp = requests.get(list_url, timeout=12)
+        if list_resp.status_code != 200:
+            return None, f"Google API Key verification error [{list_resp.status_code}]: {list_resp.text}"
+        models_data = list_resp.json()
+    except Exception as e:
+        return None, f"Connection to Google AI Studio failed: {e}. Please check internet connectivity."
+
+    candidates = []
+    for m in models_data.get("models", []):
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" in methods:
+            name = m.get("name", "").replace("models/", "")
+            if name:
+                candidates.append(name)
+
+    if not candidates:
+        return None, "No text/vision models are enabled for this API key in Google AI Studio."
+
+    # Prioritize flash models first (fastest and standard for vision), then pro
+    flash_models = [m for m in candidates if "flash" in m.lower()]
+    pro_models = [m for m in candidates if "pro" in m.lower()]
+    other_models = [m for m in candidates if m not in flash_models and m not in pro_models]
+    models_to_try = flash_models + pro_models + other_models
+
     opt_bytes, opt_mime = optimize_image_for_ocr(image_bytes)
     b64_img = base64.b64encode(opt_bytes).decode("utf-8")
     
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-2.5-pro"]
     prompt = """
     Extract all individual line items from this restaurant/concession receipt.
     Assign each item to one of these exact categories: 'Food Ingredients', 'Packaging & Disposables', 'Condiments & Supplies', 'Beverage', 'Dairy', 'Produce', or 'Meat/Poultry'.
@@ -127,11 +149,10 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": opt_mime, "data": b64_img}}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
-    
+
     last_err = ""
-    for model_name in candidate_models:
-        raw_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={clean_key}"
-        url = clean_api_url(raw_url)
+    for model_name in models_to_try[:4]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={clean_key}"
         for attempt in range(2):
             try:
                 resp = requests.post(url, json=payload, timeout=40)
@@ -145,23 +166,20 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
                         raw_text = raw_text[:-3]
                     return json.loads(raw_text.strip()), None
                 elif resp.status_code in [503, 429]:
-                    last_err = f"{model_name} busy (HTTP {resp.status_code})"
+                    last_err = f"{model_name} busy (status {resp.status_code})"
                     time.sleep(1.0)
                     continue
-                elif resp.status_code == 404:
-                    last_err = f"{model_name} not found"
-                    break
                 else:
-                    last_err = f"API Error [{resp.status_code}]: {resp.text}"
+                    last_err = f"{model_name} returned [{resp.status_code}]: {resp.text}"
                     break
             except requests.exceptions.Timeout:
-                last_err = f"{model_name} timed out"
+                last_err = f"{model_name} connection timed out"
                 continue
             except Exception as e:
                 last_err = str(e)
                 break
 
-    return None, f"Could not extract receipt. {last_err}. Please retry in a few moments."
+    return None, f"Receipt extraction failed. ({last_err}). Please retry in a few moments."
 
 # --- UNIVERSAL SQUARE CSV PARSER ---
 def extract_date_from_text(text):
@@ -442,7 +460,7 @@ with tabs[2]:
             if not vision_key:
                 st.error("Please enter a Gemini API Key to run Vision OCR.")
             else:
-                with st.spinner("Analyzing receipt with Vision AI..."):
+                with st.spinner("Connecting to Google AI Studio & analyzing receipt..."):
                     img_bytes = active_receipt.getvalue()
                     mime_type = active_receipt.type or "image/jpeg"
                     parsed_result, err = parse_receipt_with_vision(img_bytes, mime_type, vision_key)
