@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -101,12 +102,13 @@ def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
     except Exception:
         return image_bytes, "image/jpeg"
 
-# --- VISION OCR PARSER ---
+# --- VISION OCR PARSER WITH FAILOVER ---
 def parse_receipt_with_vision(image_bytes, mime_type, api_key):
-    """Sends compressed receipt photo to Gemini Vision API with 90s timeout safety."""
+    """Sends compressed receipt photo to Gemini Vision with automatic retry and model failover."""
     opt_bytes, opt_mime = optimize_image_for_ocr(image_bytes)
     b64_img = base64.b64encode(opt_bytes).decode("utf-8")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key.strip()}"
+    
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     prompt = """
     Extract all individual line items from this restaurant/concession receipt.
     Assign each item to one of these exact categories: 'Food Ingredients', 'Packaging & Disposables', 'Condiments & Supplies', 'Beverage', 'Dairy', 'Produce', or 'Meat/Poultry'.
@@ -117,16 +119,31 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": opt_mime, "data": b64_img}}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=90)
-        if resp.status_code != 200:
-            return None, f"Vision API Error [{resp.status_code}]: {resp.text}"
-        raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(raw_json), None
-    except requests.exceptions.Timeout:
-        return None, "Scanning timed out (Google Vision took longer than 90s). Please try snapping closer to the receipt text and retry."
-    except Exception as e:
-        return None, f"Scanning connection error: {e}"
+    
+    last_err = ""
+    for model_name in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key.strip()}"
+        for attempt in range(2):
+            try:
+                resp = requests.post(url, json=payload, timeout=45)
+                if resp.status_code == 200:
+                    raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    return json.loads(raw_json), None
+                elif resp.status_code in [503, 429]:
+                    last_err = f"{model_name} busy (HTTP {resp.status_code})"
+                    time.sleep(1.5)
+                    continue
+                else:
+                    last_err = f"Vision API Error [{resp.status_code}]: {resp.text}"
+                    break
+            except requests.exceptions.Timeout:
+                last_err = f"{model_name} connection timed out"
+                continue
+            except Exception as e:
+                last_err = str(e)
+                break
+                
+    return None, f"All vision models currently experiencing peak traffic ({last_err}). Please tap scan once more."
 
 # --- UNIVERSAL SQUARE CSV PARSER ---
 def extract_date_from_text(text):
@@ -447,7 +464,7 @@ with tabs[2]:
             st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ✍️ Manual Outlay Entry")
+    st.markdown("#### ✍️️ Manual Outlay Entry")
     with st.form("manual_cogs_form", clear_on_submit=True):
         c_date = st.date_input("Disbursement Date", value=date.today())
         c_vendor = st.selectbox("Vendor", [
