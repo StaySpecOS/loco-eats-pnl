@@ -88,6 +88,13 @@ def check_password():
 if not check_password():
     st.stop()
 
+# --- URL SANITIZER (FIXES CONNECTION ADAPTER ERRORS) ---
+def clean_api_url(raw_url):
+    """Strips all invisible unicode, zero-width spaces, and whitespace to prevent requests errors."""
+    cleaned = "".join(c for c in str(raw_url) if 32 < ord(c) < 127).strip()
+    match = re.search(r'https?://[a-zA-Z0-9./:?=&_%-]+', cleaned)
+    return match.group(0) if match else cleaned
+
 # --- IMAGE OPTIMIZER & COMPRESSION ---
 def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
     """Resizes large smartphone photos to prevent HTTP ReadTimeout errors."""
@@ -102,38 +109,14 @@ def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
     except Exception:
         return image_bytes, "image/jpeg"
 
-# --- DYNAMIC MODEL DISCOVERY & VISION OCR ---
-def get_live_gemini_models(api_key):
-    """Dynamically queries Google AI Studio to discover valid models on this API key."""
-    try:
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models?key=](https://generativelanguage.googleapis.com/v1beta/models?key=){api_key.strip()}"
-        resp = requests.get(url, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            valid = []
-            for m in data.get("models", []):
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    name = m.get("name", "").replace("models/", "")
-                    if name:
-                        valid.append(name)
-            # Prioritize fast models (flash), then powerful models (pro)
-            flash = [m for m in valid if "flash" in m.lower()]
-            pro = [m for m in valid if "pro" in m.lower()]
-            ordered = flash + [m for m in pro if m not in flash]
-            if ordered:
-                return ordered
-    except Exception:
-        pass
-    # Guaranteed fallback model identifiers
-    return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash-latest", "gemini-1.5-pro-latest"]
-
+# --- VISION OCR PARSER ---
 def parse_receipt_with_vision(image_bytes, mime_type, api_key):
-    """Sends compressed receipt photo to Google Vision with dynamic discovery and failover."""
+    """Sends compressed receipt photo to Google Vision with strict URL cleaning and model failover."""
+    clean_key = "".join(c for c in str(api_key).strip() if 32 < ord(c) < 127)
     opt_bytes, opt_mime = optimize_image_for_ocr(image_bytes)
     b64_img = base64.b64encode(opt_bytes).decode("utf-8")
     
-    models_to_try = get_live_gemini_models(api_key)
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-2.5-pro"]
     prompt = """
     Extract all individual line items from this restaurant/concession receipt.
     Assign each item to one of these exact categories: 'Food Ingredients', 'Packaging & Disposables', 'Condiments & Supplies', 'Beverage', 'Dairy', 'Produce', or 'Meat/Poultry'.
@@ -146,8 +129,9 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
     }
     
     last_err = ""
-    for model_name in models_to_try[:4]:  # Try top 4 live models
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={api_key.strip()}"
+    for model_name in candidate_models:
+        raw_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={clean_key}"
+        url = clean_api_url(raw_url)
         for attempt in range(2):
             try:
                 resp = requests.post(url, json=payload, timeout=40)
@@ -161,7 +145,7 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
                         raw_text = raw_text[:-3]
                     return json.loads(raw_text.strip()), None
                 elif resp.status_code in [503, 429]:
-                    last_err = f"{model_name} busy (status {resp.status_code})"
+                    last_err = f"{model_name} busy (HTTP {resp.status_code})"
                     time.sleep(1.0)
                     continue
                 elif resp.status_code == 404:
