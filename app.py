@@ -4,6 +4,7 @@ import streamlit as st
 import requests
 import json
 import base64
+import re
 from datetime import datetime, date
 
 # --- DATABASE SETUP ---
@@ -96,6 +97,23 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
     return json.loads(raw_json), None
 
 # --- UNIVERSAL SQUARE CSV PARSER ---
+def extract_date_from_text(text):
+    if not text:
+        return None
+    m = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', str(text))
+    if m:
+        try:
+            return pd.to_datetime(m.group(1)).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    m = re.search(r'([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})', str(text))
+    if m:
+        try:
+            return pd.to_datetime(m.group(1)).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    return None
+
 def parse_square_file(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
@@ -108,7 +126,7 @@ def parse_square_file(uploaded_file):
     def clean_curr(s):
         return pd.to_numeric(s.astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False), errors="coerce").fillna(0.0)
 
-    # Type A: Square Transfer Details Export
+    # FORMAT 1: Square Transfer Details Export
     if any(c in df.columns for c in ["Payment Date", "Deposit Date"]) and "Collected" in df.columns:
         date_col = "Payment Date" if "Payment Date" in df.columns else "Deposit Date"
         for col in ["Collected", "Fees", "Deposited"]:
@@ -125,13 +143,58 @@ def parse_square_file(uploaded_file):
         grouped.rename(columns={date_col: "sales_date"}, inplace=True)
         grouped["net_sales"] = (grouped["gross_sales"] / 1.06).round(2)
         grouped["tax"] = (grouped["gross_sales"] - grouped["net_sales"]).round(2)
-        return "Transfer Details Export", grouped
+        return "Transfer Details Export", grouped, None
 
-    # Type B: Square Transactions or Sales Summary Export
+    # FORMAT 2: Square Sales Summary (Vertical 2-column key-value format)
+    first_col_str = str(df.columns[0]).lower()
+    first_col_values = [str(x).strip().lower() for x in df.iloc[:, 0].tolist()] if not df.empty else []
+    
+    if "sales summary" in first_col_str or "gross sales" in first_col_values:
+        metrics = {}
+        for _, row in df.iterrows():
+            k = str(row.iloc[0]).strip().lower()
+            v = str(row.iloc[1]).strip() if len(row) > 1 else "0"
+            metrics[k] = v
+
+        def to_float(val_str):
+            if not val_str or val_str == "nan":
+                return 0.0
+            cleaned = re.sub(r"[^\d.-]", "", val_str)
+            try:
+                return float(cleaned)
+            except Exception:
+                return 0.0
+
+        gross = to_float(metrics.get("gross sales", "0"))
+        net = to_float(metrics.get("net sales", "0"))
+        tax = to_float(metrics.get("tax", "0"))
+        fees = abs(to_float(metrics.get("fees", "0")))
+        orders = int(to_float(metrics.get("total transactions", metrics.get("transactions", "0"))))
+
+        if gross == 0.0 and "total collected" in metrics:
+            gross = to_float(metrics.get("total collected", "0"))
+        if net == 0.0 and gross > 0:
+            net = round(gross - tax, 2)
+
+        # Detect date from filename or top header
+        detected_date = extract_date_from_text(getattr(uploaded_file, "name", "")) or extract_date_from_text(df.columns[0])
+        default_date = detected_date if detected_date else date.today().strftime("%Y-%m-%d")
+
+        summary_df = pd.DataFrame([{
+            "sales_date": default_date,
+            "gross_sales": gross,
+            "net_sales": net,
+            "tax": tax,
+            "processing_fees": fees,
+            "order_count": orders
+        }])
+        return "Sales Summary Report", summary_df, detected_date
+
+    # FORMAT 3: Standard Square Transactions Report (Multi-column horizontal)
     date_col = next((c for c in df.columns if c.strip().lower() in ["date", "transaction date", "payment date"]), None)
     gross_col = next((c for c in df.columns if c.strip().lower() in ["gross sales", "total collected", "total"]), None)
 
-    if date_col and gross_col:
+    if date_col and gross_col and len(df.columns) > 2:
         for c in [gross_col, "Net Sales", "Tax", "Fees"]:
             if c in df.columns:
                 df[c] = clean_curr(df[c])
@@ -151,9 +214,9 @@ def parse_square_file(uploaded_file):
             order_count=(date_col, "count")
         ).reset_index()
         grouped.rename(columns={"clean_date": "sales_date"}, inplace=True)
-        return "Transactions Report", grouped
+        return "Transactions Report", grouped, None
 
-    return None, df.columns.tolist()
+    return None, df.columns.tolist(), None
 
 # --- STREAMLIT UI CONFIGURATION ---
 st.set_page_config(page_title="LOCO Eats - COGS & P&L Engine", layout="wide")
@@ -214,18 +277,25 @@ with tabs[0]:
         st.write(f"- **Total Square Processing Fees:** `${total_fees:,.2f}` ({effective_fee:.2f}% of gross)")
         st.write(f"- **Fixed Daily Overhead Allocation:** `${daily_fixed_burn:,.2f} / day`")
 
-# --- TAB 2: SQUARE DAILY SALES (UNIVERSAL CSV PARSER) ---
+# --- TAB 2: SQUARE DAILY SALES ---
 with tabs[1]:
     st.subheader("Square Sales Reconciliation")
     
     st.markdown("#### 📁 Upload Square CSV Report")
-    st.caption("Supports both Square 'Transfer Details' CSVs and standard Square 'Transactions / Sales Summary' CSVs.")
+    st.caption("Upload any Square export: **Sales Summary**, **Transfer Details**, or **Transactions Report**.")
     uploaded_file = st.file_uploader("Upload Square CSV Export", type=["csv"])
     
     if uploaded_file is not None:
-        report_type, parsed_data = parse_square_file(uploaded_file)
+        report_type, parsed_data, detected_date = parse_square_file(uploaded_file)
         if report_type:
-            st.success(f"Detected format: **{report_type}** ({len(parsed_data)} operational days)")
+            st.success(f"Detected Square Format: **{report_type}**")
+            
+            # If Sales Summary without auto-detected date, let user confirm the date
+            if report_type == "Sales Summary Report":
+                initial_d = pd.to_datetime(detected_date).date() if detected_date else date.today()
+                confirmed_date = st.date_input("Confirm Operating Date for this Report:", value=initial_d)
+                parsed_data["sales_date"] = confirmed_date.strftime("%Y-%m-%d")
+
             st.dataframe(parsed_data, use_container_width=True)
             
             if st.button(f"Commit {len(parsed_data)} Days to Database", type="primary"):
@@ -248,7 +318,6 @@ with tabs[1]:
         else:
             st.error("Uploaded CSV headers do not match expected Square formats.")
             st.write("Columns found in your uploaded file:", parsed_data)
-            st.info("Expected either Transfer columns ('Payment Date', 'Collected') or Transaction columns ('Date', 'Gross Sales').")
 
     st.markdown("---")
     st.markdown("#### Manual Sales Entry")
