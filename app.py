@@ -102,13 +102,38 @@ def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
     except Exception:
         return image_bytes, "image/jpeg"
 
-# --- VISION OCR PARSER WITH FAILOVER ---
+# --- DYNAMIC MODEL DISCOVERY & VISION OCR ---
+def get_live_gemini_models(api_key):
+    """Dynamically queries Google AI Studio to discover valid models on this API key."""
+    try:
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models?key=](https://generativelanguage.googleapis.com/v1beta/models?key=){api_key.strip()}"
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            valid = []
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    name = m.get("name", "").replace("models/", "")
+                    if name:
+                        valid.append(name)
+            # Prioritize fast models (flash), then powerful models (pro)
+            flash = [m for m in valid if "flash" in m.lower()]
+            pro = [m for m in valid if "pro" in m.lower()]
+            ordered = flash + [m for m in pro if m not in flash]
+            if ordered:
+                return ordered
+    except Exception:
+        pass
+    # Guaranteed fallback model identifiers
+    return ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash-latest", "gemini-1.5-pro-latest"]
+
 def parse_receipt_with_vision(image_bytes, mime_type, api_key):
-    """Sends compressed receipt photo to Gemini Vision with automatic retry and model failover."""
+    """Sends compressed receipt photo to Google Vision with dynamic discovery and failover."""
     opt_bytes, opt_mime = optimize_image_for_ocr(image_bytes)
     b64_img = base64.b64encode(opt_bytes).decode("utf-8")
     
-    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models_to_try = get_live_gemini_models(api_key)
     prompt = """
     Extract all individual line items from this restaurant/concession receipt.
     Assign each item to one of these exact categories: 'Food Ingredients', 'Packaging & Disposables', 'Condiments & Supplies', 'Beverage', 'Dairy', 'Produce', or 'Meat/Poultry'.
@@ -121,29 +146,38 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
     }
     
     last_err = ""
-    for model_name in candidate_models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key.strip()}"
+    for model_name in models_to_try[:4]:  # Try top 4 live models
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={api_key.strip()}"
         for attempt in range(2):
             try:
-                resp = requests.post(url, json=payload, timeout=45)
+                resp = requests.post(url, json=payload, timeout=40)
                 if resp.status_code == 200:
-                    raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    return json.loads(raw_json), None
+                    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text[7:]
+                    elif raw_text.startswith("```"):
+                        raw_text = raw_text[3:]
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3]
+                    return json.loads(raw_text.strip()), None
                 elif resp.status_code in [503, 429]:
-                    last_err = f"{model_name} busy (HTTP {resp.status_code})"
-                    time.sleep(1.5)
+                    last_err = f"{model_name} busy (status {resp.status_code})"
+                    time.sleep(1.0)
                     continue
+                elif resp.status_code == 404:
+                    last_err = f"{model_name} not found"
+                    break
                 else:
-                    last_err = f"Vision API Error [{resp.status_code}]: {resp.text}"
+                    last_err = f"API Error [{resp.status_code}]: {resp.text}"
                     break
             except requests.exceptions.Timeout:
-                last_err = f"{model_name} connection timed out"
+                last_err = f"{model_name} timed out"
                 continue
             except Exception as e:
                 last_err = str(e)
                 break
-                
-    return None, f"All vision models currently experiencing peak traffic ({last_err}). Please tap scan once more."
+
+    return None, f"Could not extract receipt. {last_err}. Please retry in a few moments."
 
 # --- UNIVERSAL SQUARE CSV PARSER ---
 def extract_date_from_text(text):
@@ -424,7 +458,7 @@ with tabs[2]:
             if not vision_key:
                 st.error("Please enter a Gemini API Key to run Vision OCR.")
             else:
-                with st.spinner("Analyzing receipt and extracting line items..."):
+                with st.spinner("Analyzing receipt with Vision AI..."):
                     img_bytes = active_receipt.getvalue()
                     mime_type = active_receipt.type or "image/jpeg"
                     parsed_result, err = parse_receipt_with_vision(img_bytes, mime_type, vision_key)
@@ -464,7 +498,7 @@ with tabs[2]:
             st.rerun()
 
     st.markdown("---")
-    st.markdown("#### ✍️️ Manual Outlay Entry")
+    st.markdown("#### ✍ Manual Outlay Entry")
     with st.form("manual_cogs_form", clear_on_submit=True):
         c_date = st.date_input("Disbursement Date", value=date.today())
         c_vendor = st.selectbox("Vendor", [
