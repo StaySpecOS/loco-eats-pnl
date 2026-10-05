@@ -95,6 +95,66 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
     raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(raw_json), None
 
+# --- UNIVERSAL SQUARE CSV PARSER ---
+def parse_square_file(uploaded_file):
+    try:
+        df = pd.read_csv(uploaded_file)
+    except Exception:
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+
+    def clean_curr(s):
+        return pd.to_numeric(s.astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False), errors="coerce").fillna(0.0)
+
+    # Type A: Square Transfer Details Export
+    if any(c in df.columns for c in ["Payment Date", "Deposit Date"]) and "Collected" in df.columns:
+        date_col = "Payment Date" if "Payment Date" in df.columns else "Deposit Date"
+        for col in ["Collected", "Fees", "Deposited"]:
+            if col in df.columns:
+                df[col] = clean_curr(df[col])
+        if "Type" in df.columns:
+            df = df[df["Type"] == "Payment"]
+            
+        grouped = df.groupby(date_col).agg(
+            gross_sales=("Collected", "sum"),
+            processing_fees=("Fees", lambda x: abs(x.sum())),
+            order_count=("Transaction ID", "count" if "Transaction ID" in df.columns else "size")
+        ).reset_index()
+        grouped.rename(columns={date_col: "sales_date"}, inplace=True)
+        grouped["net_sales"] = (grouped["gross_sales"] / 1.06).round(2)
+        grouped["tax"] = (grouped["gross_sales"] - grouped["net_sales"]).round(2)
+        return "Transfer Details Export", grouped
+
+    # Type B: Square Transactions or Sales Summary Export
+    date_col = next((c for c in df.columns if c.strip().lower() in ["date", "transaction date", "payment date"]), None)
+    gross_col = next((c for c in df.columns if c.strip().lower() in ["gross sales", "total collected", "total"]), None)
+
+    if date_col and gross_col:
+        for c in [gross_col, "Net Sales", "Tax", "Fees"]:
+            if c in df.columns:
+                df[c] = clean_curr(df[c])
+
+        df["clean_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+        df = df.dropna(subset=["clean_date"])
+
+        net_col = "Net Sales" if "Net Sales" in df.columns else None
+        tax_col = "Tax" if "Tax" in df.columns else None
+        fees_col = "Fees" if "Fees" in df.columns else None
+
+        grouped = df.groupby("clean_date").agg(
+            gross_sales=(gross_col, "sum"),
+            net_sales=(net_col, "sum") if net_col else (gross_col, lambda x: round(x.sum() / 1.06, 2)),
+            tax=(tax_col, "sum") if tax_col else (gross_col, lambda x: round(x.sum() - (x.sum() / 1.06), 2)),
+            processing_fees=(fees_col, lambda x: abs(x.sum())) if fees_col else (gross_col, lambda x: 0.0),
+            order_count=(date_col, "count")
+        ).reset_index()
+        grouped.rename(columns={"clean_date": "sales_date"}, inplace=True)
+        return "Transactions Report", grouped
+
+    return None, df.columns.tolist()
+
 # --- STREAMLIT UI CONFIGURATION ---
 st.set_page_config(page_title="LOCO Eats - COGS & P&L Engine", layout="wide")
 st.title("LOCO Eats | Cost Accounting & Sales Reconciliation Engine")
@@ -154,54 +214,41 @@ with tabs[0]:
         st.write(f"- **Total Square Processing Fees:** `${total_fees:,.2f}` ({effective_fee:.2f}% of gross)")
         st.write(f"- **Fixed Daily Overhead Allocation:** `${daily_fixed_burn:,.2f} / day`")
 
-# --- TAB 2: SQUARE DAILY SALES ---
+# --- TAB 2: SQUARE DAILY SALES (UNIVERSAL CSV PARSER) ---
 with tabs[1]:
     st.subheader("Square Sales Reconciliation")
     
-    st.markdown("#### 📁 Upload Square Transfer CSV")
-    uploaded_file = st.file_uploader("Upload Square 'transfer-details-*.csv'", type=["csv"])
+    st.markdown("#### 📁 Upload Square CSV Report")
+    st.caption("Supports both Square 'Transfer Details' CSVs and standard Square 'Transactions / Sales Summary' CSVs.")
+    uploaded_file = st.file_uploader("Upload Square CSV Export", type=["csv"])
+    
     if uploaded_file is not None:
-        try:
-            raw_csv = pd.read_csv(uploaded_file)
-            if "Payment Date" in raw_csv.columns and "Collected" in raw_csv.columns:
-                for col in ["Collected", "Fees", "Deposited"]:
-                    if col in raw_csv.columns:
-                        raw_csv[col] = raw_csv[col].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).astype(float)
-                
-                if "Type" in raw_csv.columns:
-                    raw_csv = raw_csv[raw_csv["Type"] == "Payment"]
-                    
-                grouped = raw_csv.groupby("Payment Date").agg(
-                    gross_sales=("Collected", "sum"),
-                    processing_fees=("Fees", lambda x: abs(x.sum())),
-                    order_count=("Transaction ID", "count" if "Transaction ID" in raw_csv.columns else "size")
-                ).reset_index()
-                
-                grouped.rename(columns={"Payment Date": "sales_date"}, inplace=True)
-                grouped["net_sales"] = (grouped["gross_sales"] / 1.06).round(2)
-                grouped["tax"] = (grouped["gross_sales"] - grouped["net_sales"]).round(2)
-
-                if st.button(f"Commit {len(grouped)} Days from CSV"):
-                    conn = get_connection()
-                    for _, r in grouped.iterrows():
-                        conn.execute("""
-                            INSERT INTO daily_sales (sales_date, gross_sales, net_sales, tax, processing_fees, order_count)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(sales_date) DO UPDATE SET
-                                gross_sales=excluded.gross_sales,
-                                net_sales=excluded.net_sales,
-                                tax=excluded.tax,
-                                processing_fees=excluded.processing_fees,
-                                order_count=excluded.order_count
-                        """, (r["sales_date"], r["gross_sales"], r["net_sales"], r["tax"], r["processing_fees"], int(r["order_count"])))
-                    conn.commit()
-                    conn.close()
-                    st.success("Successfully imported all transactions from CSV!")
-                    st.rerun()
-            else:
-                st.error("Uploaded CSV does not match the Square Transfer format.")
-        except Exception as e:
-            st.error(f"Error parsing CSV: {e}")
+        report_type, parsed_data = parse_square_file(uploaded_file)
+        if report_type:
+            st.success(f"Detected format: **{report_type}** ({len(parsed_data)} operational days)")
+            st.dataframe(parsed_data, use_container_width=True)
+            
+            if st.button(f"Commit {len(parsed_data)} Days to Database", type="primary"):
+                conn = get_connection()
+                for _, r in parsed_data.iterrows():
+                    conn.execute("""
+                        INSERT INTO daily_sales (sales_date, gross_sales, net_sales, tax, processing_fees, order_count)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(sales_date) DO UPDATE SET
+                            gross_sales=excluded.gross_sales,
+                            net_sales=excluded.net_sales,
+                            tax=excluded.tax,
+                            processing_fees=excluded.processing_fees,
+                            order_count=excluded.order_count
+                    """, (str(r["sales_date"]), float(r["gross_sales"]), float(r["net_sales"]), float(r["tax"]), float(r["processing_fees"]), int(r["order_count"])))
+                conn.commit()
+                conn.close()
+                st.success("Successfully imported all sales data into the database!")
+                st.rerun()
+        else:
+            st.error("Uploaded CSV headers do not match expected Square formats.")
+            st.write("Columns found in your uploaded file:", parsed_data)
+            st.info("Expected either Transfer columns ('Payment Date', 'Collected') or Transaction columns ('Date', 'Gross Sales').")
 
     st.markdown("---")
     st.markdown("#### Manual Sales Entry")
