@@ -1,3 +1,5 @@
+import os
+import io
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -6,9 +8,11 @@ import json
 import base64
 import re
 from datetime import datetime, date
+from PIL import Image
 
 # --- DATABASE SETUP ---
-DB_FILE = "loco_eats_pnl.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "loco_eats_pnl.db")
 
 def get_connection():
     conn = sqlite3.connect(DB_FILE)
@@ -50,10 +54,17 @@ def init_db():
 
 init_db()
 
+# --- SAFE SECRETS HELPER ---
+def get_safe_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
 # --- SECURITY ACCESS GATE ---
 def check_password():
     def password_entered():
-        master_pw = st.secrets.get("APP_PASSWORD", "LocoEats2026!") if hasattr(st, "secrets") else "LocoEats2026!"
+        master_pw = get_safe_secret("APP_PASSWORD", "LocoEats2026!")
         if st.session_state.get("password_input") == master_pw:
             st.session_state["password_correct"] = True
             if "password_input" in st.session_state:
@@ -76,9 +87,25 @@ def check_password():
 if not check_password():
     st.stop()
 
+# --- IMAGE OPTIMIZER & COMPRESSION ---
+def optimize_image_for_ocr(image_bytes, max_dim=1600, quality=85):
+    """Resizes large smartphone photos to prevent HTTP ReadTimeout errors."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="JPEG", quality=quality, optimize=True)
+        return out_buf.getvalue(), "image/jpeg"
+    except Exception:
+        return image_bytes, "image/jpeg"
+
 # --- VISION OCR PARSER ---
 def parse_receipt_with_vision(image_bytes, mime_type, api_key):
-    b64_img = base64.b64encode(image_bytes).decode("utf-8")
+    """Sends compressed receipt photo to Gemini Vision API with 90s timeout safety."""
+    opt_bytes, opt_mime = optimize_image_for_ocr(image_bytes)
+    b64_img = base64.b64encode(opt_bytes).decode("utf-8")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key.strip()}"
     prompt = """
     Extract all individual line items from this restaurant/concession receipt.
@@ -87,14 +114,19 @@ def parse_receipt_with_vision(image_bytes, mime_type, api_key):
     {"vendor": "string", "date": "YYYY-MM-DD", "invoice_num": "string", "items": [{"item_name": "string", "category": "string", "amount": 0.00}]}
     """
     payload = {
-        "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_img}}]}],
+        "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": opt_mime, "data": b64_img}}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
-    resp = requests.post(url, json=payload, timeout=30)
-    if resp.status_code != 200:
-        return None, f"Vision API Error [{resp.status_code}]: {resp.text}"
-    raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(raw_json), None
+    try:
+        resp = requests.post(url, json=payload, timeout=90)
+        if resp.status_code != 200:
+            return None, f"Vision API Error [{resp.status_code}]: {resp.text}"
+        raw_json = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(raw_json), None
+    except requests.exceptions.Timeout:
+        return None, "Scanning timed out (Google Vision took longer than 90s). Please try snapping closer to the receipt text and retry."
+    except Exception as e:
+        return None, f"Scanning connection error: {e}"
 
 # --- UNIVERSAL SQUARE CSV PARSER ---
 def extract_date_from_text(text):
@@ -126,7 +158,7 @@ def parse_square_file(uploaded_file):
     def clean_curr(s):
         return pd.to_numeric(s.astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False), errors="coerce").fillna(0.0)
 
-    # FORMAT 1: Square Transfer Details Export
+    # FORMAT 1: Transfer Details Export
     if any(c in df.columns for c in ["Payment Date", "Deposit Date"]) and "Collected" in df.columns:
         date_col = "Payment Date" if "Payment Date" in df.columns else "Deposit Date"
         for col in ["Collected", "Fees", "Deposited"]:
@@ -145,7 +177,7 @@ def parse_square_file(uploaded_file):
         grouped["tax"] = (grouped["gross_sales"] - grouped["net_sales"]).round(2)
         return "Transfer Details Export", grouped, None
 
-    # FORMAT 2: Square Sales Summary (Vertical 2-column key-value format)
+    # FORMAT 2: Square Sales Summary (Vertical 2-column)
     first_col_str = str(df.columns[0]).lower()
     first_col_values = [str(x).strip().lower() for x in df.iloc[:, 0].tolist()] if not df.empty else []
     
@@ -176,7 +208,6 @@ def parse_square_file(uploaded_file):
         if net == 0.0 and gross > 0:
             net = round(gross - tax, 2)
 
-        # Detect date from filename or top header
         detected_date = extract_date_from_text(getattr(uploaded_file, "name", "")) or extract_date_from_text(df.columns[0])
         default_date = detected_date if detected_date else date.today().strftime("%Y-%m-%d")
 
@@ -190,7 +221,7 @@ def parse_square_file(uploaded_file):
         }])
         return "Sales Summary Report", summary_df, detected_date
 
-    # FORMAT 3: Standard Square Transactions Report (Multi-column horizontal)
+    # FORMAT 3: Transactions Report
     date_col = next((c for c in df.columns if c.strip().lower() in ["date", "transaction date", "payment date"]), None)
     gross_col = next((c for c in df.columns if c.strip().lower() in ["gross sales", "total collected", "total"]), None)
 
@@ -290,7 +321,6 @@ with tabs[1]:
         if report_type:
             st.success(f"Detected Square Format: **{report_type}**")
             
-            # If Sales Summary without auto-detected date, let user confirm the date
             if report_type == "Sales Summary Report":
                 initial_d = pd.to_datetime(detected_date).date() if detected_date else date.today()
                 confirmed_date = st.date_input("Confirm Operating Date for this Report:", value=initial_d)
@@ -355,13 +385,11 @@ with tabs[1]:
         st.write("#### Reconciled Sales Ledger")
         st.dataframe(df_sales_history, use_container_width=True)
 
-# --- TAB 3: COGS & PACKAGING LOG (WITH AI VISION SCANNER) ---
+# --- TAB 3: COGS & PACKAGING LOG ---
 with tabs[2]:
     st.subheader("Direct COGS Ingestion")
     
     st.markdown("#### 📷 AI Vision Receipt Scanner (Automated Line-Item Extraction)")
-    st.caption("Take a photo with your phone camera or upload a saved receipt image from Restaurant Depot, Costco, or GFS.")
-    
     col_cam, col_upload = st.columns(2)
     with col_cam:
         cam_pic = st.camera_input("Snap receipt with phone camera")
@@ -371,7 +399,7 @@ with tabs[2]:
     active_receipt = cam_pic or file_pic
     
     if active_receipt is not None:
-        vision_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+        vision_key = get_safe_secret("GEMINI_API_KEY", "")
         if not vision_key:
             vision_key = st.text_input("Gemini API Key (or save in Streamlit Secrets)", type="password")
             
